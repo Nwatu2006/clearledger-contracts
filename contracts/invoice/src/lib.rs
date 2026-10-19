@@ -912,6 +912,8 @@ impl InvoiceContract {
     /// * `InvoiceError::NotFound` if the invoice does not exist.
     /// * `InvoiceError::VerificationRequired` if no Underwrite agent attestation has
     ///   been submitted for this invoice (see `submit_attestation`).
+    /// * `InvoiceError::AgentRegistryNotConfigured` if an attestation exists but
+    ///   the agent-registry contract has not been configured.
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Created`.
     /// * `InvoiceError::IssuerNotVerified` if the issuer's registry verification
     ///   has since been revoked.
@@ -941,6 +943,10 @@ impl InvoiceContract {
         {
             panic_with_error!(&env, InvoiceError::VerificationRequired);
         }
+        env.storage()
+            .instance()
+            .get::<_, Address>(&DataKey::AgentRegistryContract)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::AgentRegistryNotConfigured));
         invoice.issuer.require_auth();
         if invoice.status != InvoiceStatus::Created {
             panic_with_error!(&env, InvoiceError::InvalidStatusTransition);
@@ -1185,9 +1191,9 @@ impl InvoiceContract {
     /// agent's registered pubkey, not from who relays the transaction.
     ///
     /// # Panics
-    /// * `InvoiceError::NotFound` if the invoice does not exist, or if the
-    ///   agent-registry contract has not been configured via
-    ///   `set_agent_registry_contract`.
+    /// * `InvoiceError::NotFound` if the invoice does not exist.
+    /// * `InvoiceError::AgentRegistryNotConfigured` if the agent-registry
+    ///   contract has not been configured via `set_agent_registry_contract`.
     /// * `InvoiceError::InvalidAmount` if `payload` fails to decode as an
     ///   `AttestationPayload`, if its `domain_separator` doesn't match this
     ///   contract's, or if its `invoice_id` doesn't match the `invoice_id`
@@ -1246,7 +1252,7 @@ impl InvoiceContract {
             .storage()
             .instance()
             .get(&DataKey::AgentRegistryContract)
-            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::AgentRegistryNotConfigured));
         let mut args = Vec::new(&env);
         args.push_back(decoded.agent_id.clone().into_val(&env));
         let agent: Option<Agent> =

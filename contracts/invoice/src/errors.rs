@@ -37,4 +37,8 @@ pub enum InvoiceError {
     /// [`MAX_BATCH_SIZE`](crate::MAX_BATCH_SIZE), which would defeat the
     /// per-call cost bound batching exists to provide.
     BatchSizeExceeded = 28,
+    /// `submit_attestation` or `list_for_financing` was called before the
+    /// admin configured the agent-registry contract via
+    /// [`InvoiceContract::set_agent_registry_contract`](crate::InvoiceContract::set_agent_registry_contract).
+    AgentRegistryNotConfigured = 29,
 }

@@ -307,6 +307,70 @@ fn attest(env: &Env, client: &InvoiceContractClient, invoice_id: &BytesN<32>) {
     client.submit_attestation(invoice_id, &payload_bytes, &signature);
 }
 
+// ============== AGENT REGISTRY NOT CONFIGURED ==============
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_submit_attestation_without_agent_registry_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let agent_id = Symbol::new(&env, "test_agent");
+    let payload = crate::AttestationPayload {
+        domain_separator: BytesN::from_array(&env, &crate::ATTESTATION_DOMAIN_SEPARATOR),
+        invoice_id: invoice_id.clone(),
+        risk_score: 5000,
+        evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
+        agent_id,
+        nonce: 1,
+    };
+    let payload_bytes = payload.to_xdr(&env);
+    let digest = env.crypto().keccak256(&payload_bytes).to_array();
+    let (sig, recid) = test_agent_signing_key()
+        .sign_prehash_recoverable(&digest)
+        .unwrap();
+    let mut sig_bytes = [0u8; 65];
+    sig_bytes[..64].copy_from_slice(&sig.to_bytes());
+    sig_bytes[64] = recid.to_byte();
+    let signature = BytesN::from_array(&env, &sig_bytes);
+
+    client.submit_attestation(&invoice_id, &payload_bytes, &signature);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_list_for_financing_without_agent_registry_panics() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().set(
+            &crate::DataKey::Attestation(invoice_id.clone()),
+            &crate::Attestation {
+                agent_id: Symbol::new(&env, "test_agent"),
+                risk_score: 5000,
+                evidence_hash: BytesN::from_array(&env, &[9u8; 32]),
+                submitted_at: env.ledger().timestamp(),
+            },
+        );
+    });
+
+    client.list_for_financing(&invoice_id, &DEFAULT_DISCOUNT_BPS);
+}
+
+#[test]
+fn test_set_and_get_agent_registry_contract() {
+    let (env, client, _, _, _, _) = setup();
+    assert_eq!(client.get_agent_registry_contract(), None);
+
+    let agent_registry = env.register_contract(None, MockAgentRegistry);
+    client.set_agent_registry_contract(&agent_registry);
+    assert_eq!(client.get_agent_registry_contract(), Some(agent_registry));
+}
+
 // ============== FAILURE-PATH TESTS FOR submit_attestation ==============
 
 #[test]

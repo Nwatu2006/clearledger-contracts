@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `invoice`: `submit_attestation` now returns the typed
+  `InvoiceError::AgentRegistryNotConfigured` (#29) when the agent-registry
+  contract has not been wired, instead of the generic `NotFound` (#2);
+  `list_for_financing` returns the same error if an attestation exists but
+  the agent registry is unset
 - `pool.initialize` accepts three new arguments: `share_name`, `share_symbol`
   and `share_decimals`
 
