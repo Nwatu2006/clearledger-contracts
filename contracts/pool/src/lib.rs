@@ -1902,6 +1902,9 @@ impl PoolContract {
     /// Requires authorization from `admin` (via `admin.require_auth()`).
     ///
     /// # Panics
+    /// * `InvalidConfiguration` if `new_cap_bps` is zero. A zero cap would
+    ///   make every positive funding attempt fail and is therefore not a
+    ///   valid operating configuration.
     /// * `InvalidAmount` if `new_cap_bps` exceeds `10_000`.
     ///
     /// # Returns
@@ -1914,6 +1917,9 @@ impl PoolContract {
     pub fn set_max_utilization(env: Env, admin: Address, new_cap_bps: u32) -> bool {
         require_not_paused(&env);
         admin.require_auth();
+        if new_cap_bps == 0 {
+            panic_with_error!(&env, PoolError::InvalidConfiguration);
+        }
         if new_cap_bps > 10000 {
             panic_with_error!(&env, PoolError::InvalidAmount);
         }

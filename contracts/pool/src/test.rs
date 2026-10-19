@@ -1472,8 +1472,7 @@ fn test_fund_invoice_rejects_above_cap() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
-fn test_fund_invoice_rejects_when_utilization_cap_is_zero() {
+fn test_set_max_utilization_rejects_zero_without_changing_cap() {
     let te = setup();
     te.pool.set_max_utilization(&te.admin, &0);
     te.pool.deposit(&te.lp, &10_000_000_000);
@@ -6229,7 +6228,7 @@ fn prop_utilization_cap_and_funding_accounting_hold_across_op_sequences() {
             &(
                 // Sometimes a very tight cap (mostly rejections), sometimes a
                 // full cap (so funding can succeed and the cap assertion bites).
-                prop_oneof![1 => 0u32..=500u32, 1 => 1u32..=10_000u32],
+                prop_oneof![1 => 1u32..=500u32, 1 => 1u32..=10_000u32],
                 prop::collection::vec(fund_step_strategy(), 1..=PROP_MAX_STEPS),
             ),
             |(cap_bps, steps)| {
