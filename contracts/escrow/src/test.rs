@@ -19,6 +19,7 @@ use soroban_sdk::{
 
 use crate::{
     DataKey, EscrowAction, EscrowContract, EscrowContractClient, EscrowEvent, EscrowRecord,
+    MAX_HISTORY_LIMIT,
 };
 
 #[contract]
@@ -154,6 +155,29 @@ fn generate_invoice_id(env: &Env, counter: u64) -> BytesN<32> {
     let bytes = (env.ledger().timestamp() + counter).to_be_bytes();
     arr[0..8].copy_from_slice(&bytes);
     BytesN::from_array(env, &arr)
+}
+
+fn walk_history(
+    env: &Env,
+    client: &EscrowContractClient<'_>,
+    invoice_id: &BytesN<32>,
+    limit: u32,
+) -> Vec<EscrowEvent> {
+    let mut cursor = 0u32;
+    let mut events = Vec::new(env);
+    loop {
+        let page = client.get_history_page(invoice_id, &cursor, &limit);
+        let mut index = 0;
+        while index < page.items.len() {
+            events.push_back(page.items.get(index).unwrap());
+            index += 1;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    events
 }
 
 fn get_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
@@ -1100,6 +1124,156 @@ fn test_get_history_returns_action_log() {
         issuer,
         amount,
     );
+}
+
+#[test]
+fn test_get_history_page_empty_returns_no_items() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 50);
+
+    let page = client.get_history_page(&invoice_id, &0, &10);
+
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_get_history_page_first_page_and_cursor() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 51);
+
+    for round in 0..3u128 {
+        let amount = 1_000_000_000 + round;
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+    }
+
+    let history = client.get_history(&invoice_id);
+    let page = client.get_history_page(&invoice_id, &0, &2);
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items.get(0).unwrap(), history.get(0).unwrap());
+    assert_eq!(page.items.get(1).unwrap(), history.get(1).unwrap());
+    assert_eq!(page.next_cursor, Some(2));
+}
+
+#[test]
+fn test_get_history_page_multi_page_walk_has_no_gaps_or_duplicates() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 52);
+
+    for round in 0..3u128 {
+        let amount = 1_000_000_000 + round;
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+    }
+    client.lock(&invoice_id, &999, &issuer);
+
+    let expected = client.get_history(&invoice_id);
+    let walked = walk_history(&env, &client, &invoice_id, 2);
+
+    assert_eq!(expected.len(), 7);
+    assert_eq!(walked, expected);
+    assert_eq!(walked.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(walked.get(6).unwrap().action, EscrowAction::Locked);
+}
+
+#[test]
+fn test_get_history_page_exact_max_limit_and_final_cursor() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 53);
+    let amount = 1_000_000u128;
+
+    for _ in 0..(MAX_HISTORY_LIMIT / 2) {
+        client.lock(&invoice_id, &amount, &issuer);
+        client.release_to_pool(&invoice_id, &(amount / 2));
+    }
+
+    assert_eq!(client.get_history(&invoice_id).len(), MAX_HISTORY_LIMIT);
+
+    let exact = client.get_history_page(&invoice_id, &0, &MAX_HISTORY_LIMIT);
+    assert_eq!(exact.items.len(), MAX_HISTORY_LIMIT);
+    assert!(exact.next_cursor.is_none());
+
+    client.lock(&invoice_id, &amount, &issuer);
+
+    let full = client.get_history_page(&invoice_id, &0, &MAX_HISTORY_LIMIT);
+    assert_eq!(full.items.len(), MAX_HISTORY_LIMIT);
+    assert_eq!(full.next_cursor, Some(MAX_HISTORY_LIMIT));
+
+    let tail = client.get_history_page(&invoice_id, &MAX_HISTORY_LIMIT, &MAX_HISTORY_LIMIT);
+    assert_eq!(tail.items.len(), 1);
+    assert!(tail.next_cursor.is_none());
+
+    let at_end = client.get_history_page(&invoice_id, &(MAX_HISTORY_LIMIT + 1), &10);
+    assert_eq!(at_end.items.len(), 0);
+    assert!(at_end.next_cursor.is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_get_history_page_rejects_zero_limit() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 54);
+
+    client.get_history_page(&invoice_id, &0, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_get_history_page_rejects_limit_above_max() {
+    let (env, client, _admin, _pool, _issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 55);
+
+    client.get_history_page(&invoice_id, &0, &(MAX_HISTORY_LIMIT + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_get_history_page_rejects_cursor_past_end() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 56);
+
+    client.lock(&invoice_id, &1_000_000u128, &issuer);
+    client.get_history_page(&invoice_id, &2, &10);
+}
+
+#[test]
+fn test_get_history_page_appends_and_partial_release_between_pages() {
+    let (env, client, _admin, _pool, issuer, _usdc_id) = setup();
+    let invoice_id = generate_invoice_id(&env, 57);
+
+    client.lock(&invoice_id, &1_000u128, &issuer);
+
+    let first = client.get_history_page(&invoice_id, &0, &1);
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(first.items.get(0).unwrap().amount, 1_000);
+    assert_eq!(first.next_cursor, Some(1));
+
+    let partial = 400u128;
+    client.release_to_pool(&invoice_id, &partial);
+    client.lock(&invoice_id, &200u128, &issuer);
+
+    let second = client.get_history_page(&invoice_id, &first.next_cursor.unwrap(), &1);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(
+        second.items.get(0).unwrap().action,
+        EscrowAction::ReleasedToPool
+    );
+    assert_eq!(second.items.get(0).unwrap().amount, partial);
+    assert_eq!(second.next_cursor, Some(2));
+
+    let third = client.get_history_page(&invoice_id, &second.next_cursor.unwrap(), &1);
+    assert_eq!(third.items.len(), 1);
+    assert_eq!(third.items.get(0).unwrap().action, EscrowAction::Locked);
+    assert_eq!(third.items.get(0).unwrap().amount, 200);
+    assert!(third.next_cursor.is_none());
+
+    let expected = client.get_history(&invoice_id);
+    let walked = walk_history(&env, &client, &invoice_id, 1);
+    assert_eq!(expected.len(), 3);
+    assert_eq!(walked, expected);
 }
 
 #[test]

@@ -15,6 +15,15 @@ pub use types::*;
 
 const DEFAULT_MIN_LOCK_SECONDS: u64 = 60;
 
+/// Maximum number of events a single [`EscrowContract::get_history_page`] call
+/// may return.
+///
+/// The cap keeps every history read within a predictable Soroban resource
+/// budget regardless of how many events an invoice has accumulated. Requests
+/// with `limit == 0` or `limit > MAX_HISTORY_LIMIT` panic with
+/// [`EscrowError::InvalidLimit`].
+pub const MAX_HISTORY_LIMIT: u32 = 50;
+
 #[contract]
 pub struct EscrowContract;
 
@@ -546,7 +555,12 @@ impl EscrowContract {
             .unwrap_or(0)
     }
 
-    /// Returns the history of escrow events for an invoice.
+    /// Returns the complete history of escrow events for an invoice.
+    ///
+    /// This legacy view retains the original unbounded return shape so existing
+    /// callers keep working. New integrations should use
+    /// [`Self::get_history_page`], which bounds both the returned data and the
+    /// storage it hydrates.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -566,11 +580,128 @@ impl EscrowContract {
     /// let history = client.get_history(&invoice_id);
     /// ```
     pub fn get_history(env: Env, invoice_id: BytesN<32>) -> Vec<EscrowEvent> {
-        let key = DataKey::History(invoice_id);
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::HistoryCount(invoice_id.clone()))
+        {
+            if let Some(legacy) = env
+                .storage()
+                .persistent()
+                .get::<_, Vec<EscrowEvent>>(&DataKey::History(invoice_id.clone()))
+            {
+                return legacy;
+            }
+        }
+
+        let count = Self::history_count(&env, &invoice_id);
+        let mut history = Vec::new(&env);
+        let mut index = 0;
+        while index < count {
+            if let Some(event) = Self::history_event(&env, &invoice_id, index) {
+                history.push_back(event);
+            }
+            index += 1;
+        }
+        history
+    }
+
+    /// Returns one bounded page of escrow history for an invoice.
+    ///
+    /// `cursor` is the zero-based append index of the first event to return,
+    /// and is exactly the `next_cursor` returned by the previous page. Start a
+    /// walk with `cursor = 0` and continue while `next_cursor` is `Some`.
+    ///
+    /// Ordering is chronological (append order). Equal timestamps are ordered
+    /// by insertion, so events appended by a partial `release_to_pool`, a
+    /// later re-lock, or any other action between two page reads can never
+    /// shift, duplicate, or skip an entry the caller has already seen.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `invoice_id` - The invoice to query.
+    /// * `cursor` - Zero-based index of the first event to return. Must be
+    ///   `<=` the current event count; `cursor == count` returns an empty final
+    ///   page.
+    /// * `limit` - Maximum events to return. Must be in
+    ///   `1..=MAX_HISTORY_LIMIT`.
+    ///
+    /// # Auth
+    /// None. This is a read-only view.
+    ///
+    /// # Panics
+    /// * [`EscrowError::InvalidLimit`] if `limit == 0` or
+    ///   `limit > MAX_HISTORY_LIMIT`.
+    /// * [`EscrowError::InvalidCursor`] if `cursor` is greater than the number
+    ///   of recorded events.
+    ///
+    /// # Returns
+    /// * [`HistoryPage`] - Up to `limit` events plus the cursor for the next
+    ///   page, or `None` when this is the final page.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let page = client.get_history_page(&invoice_id, &0, &25);
+    /// if let Some(cursor) = page.next_cursor {
+    ///     let next = client.get_history_page(&invoice_id, &cursor, &25);
+    /// }
+    /// ```
+    pub fn get_history_page(
+        env: Env,
+        invoice_id: BytesN<32>,
+        cursor: u32,
+        limit: u32,
+    ) -> HistoryPage {
+        if limit == 0 || limit > MAX_HISTORY_LIMIT {
+            panic_with_error!(&env, EscrowError::InvalidLimit);
+        }
+
+        let count = Self::history_count(&env, &invoice_id);
+        if cursor > count {
+            panic_with_error!(&env, EscrowError::InvalidCursor);
+        }
+
+        let end = cursor.saturating_add(limit).min(count);
+        let mut items = Vec::new(&env);
+        let mut index = cursor;
+        while index < end {
+            if let Some(event) = Self::history_event(&env, &invoice_id, index) {
+                items.push_back(event);
+            }
+            index += 1;
+        }
+
+        let next_cursor = if end < count { Some(end) } else { None };
+        HistoryPage { items, next_cursor }
+    }
+
+    fn history_count(env: &Env, invoice_id: &BytesN<32>) -> u32 {
+        let key = DataKey::HistoryCount(invoice_id.clone());
+        if let Some(count) = env.storage().persistent().get::<_, u32>(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            return count;
+        }
         env.storage()
             .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(&env))
+            .get::<_, Vec<EscrowEvent>>(&DataKey::History(invoice_id.clone()))
+            .map(|history| history.len())
+            .unwrap_or(0)
+    }
+
+    fn history_event(env: &Env, invoice_id: &BytesN<32>, index: u32) -> Option<EscrowEvent> {
+        let key = DataKey::HistoryEvent(invoice_id.clone(), index);
+        if let Some(event) = env.storage().persistent().get::<_, EscrowEvent>(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            return Some(event);
+        }
+        env.storage()
+            .persistent()
+            .get::<_, Vec<EscrowEvent>>(&DataKey::History(invoice_id.clone()))
+            .and_then(|history| history.get(index))
     }
 
     fn append_history(
@@ -580,23 +711,57 @@ impl EscrowContract {
         amount: u128,
         caller: Option<Address>,
     ) {
-        let key = DataKey::History(invoice_id.clone());
-        let mut history: Vec<EscrowEvent> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Vec::new(env));
-        history.push_back(EscrowEvent {
-            invoice_id: invoice_id.clone(),
-            action,
-            amount,
-            timestamp: env.ledger().timestamp(),
-            caller,
-        });
-        env.storage().persistent().set(&key, &history);
+        let count_key = DataKey::HistoryCount(invoice_id.clone());
+        let count = match env.storage().persistent().get::<_, u32>(&count_key) {
+            Some(count) => count,
+            None => Self::migrate_legacy_history(env, invoice_id),
+        };
+
+        let event_key = DataKey::HistoryEvent(invoice_id.clone(), count);
+        env.storage().persistent().set(
+            &event_key,
+            &EscrowEvent {
+                invoice_id: invoice_id.clone(),
+                action,
+                amount,
+                timestamp: env.ledger().timestamp(),
+                caller,
+            },
+        );
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            .extend_ttl(&event_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        let next_count = count + 1;
+        env.storage().persistent().set(&count_key, &next_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    fn migrate_legacy_history(env: &Env, invoice_id: &BytesN<32>) -> u32 {
+        let legacy_key = DataKey::History(invoice_id.clone());
+        let Some(legacy) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<EscrowEvent>>(&legacy_key)
+        else {
+            return 0;
+        };
+
+        let mut index = 0;
+        while index < legacy.len() {
+            if let Some(event) = legacy.get(index) {
+                let event_key = DataKey::HistoryEvent(invoice_id.clone(), index);
+                env.storage().persistent().set(&event_key, &event);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&event_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            }
+            index += 1;
+        }
+        env.storage().persistent().remove(&legacy_key);
+        legacy.len()
     }
 
     fn extend_instance_ttl(env: &Env) {

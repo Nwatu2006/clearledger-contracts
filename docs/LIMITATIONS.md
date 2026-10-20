@@ -162,12 +162,20 @@ caller mistakes that should be fixed rather than silently skipped. Callers
 reconcile the returned funded IDs against their input to see which entries a
 capacity stop skipped.
 
-### Storing the `History` Vector
+### Escrow History Growth
 
-`escrow::append_history` stores a growable `Vec<EscrowEvent>` under
-`DataKey::History(invoice_id)`. Each event adds an element without
-compaction. For heavily-used contracts, this vector may grow large enough
-to exceed the per-entry size limit (~100 KB in practice).
+`escrow::append_history` stores each event in its own `HistoryEvent`
+entry plus a `HistoryCount` counter, so `get_history_page(invoice_id,
+cursor, limit)` hydrates at most `limit` events (capped at
+`MAX_HISTORY_LIMIT`, 50). Reads are therefore bounded regardless of how
+many events an invoice has accumulated.
+
+History is append-only and the cursor is the append index, so walking
+pages while partial releases or re-locks add new events cannot produce
+duplicates or gaps. The legacy `get_history(invoice_id)` view remains
+for compatibility; it still hydrates the whole log and should not be
+used for large histories. Old `History` vectors are read as a fallback
+and migrated to per-event entries on the next append.
 
 ---
 

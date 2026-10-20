@@ -247,11 +247,13 @@ EscrowRecord {
 }
 ```
 
-#### History Entry
+#### History Entries
 
 | DataKey | Type | Description |
 |---------|------|-------------|
-| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Append-only event log keyed by invoice ID |
+| `HistoryCount(BytesN<32>)` | `u32` | Number of events recorded for an invoice |
+| `HistoryEvent(BytesN<32>, u32)` | `EscrowEvent` | Event at the invoice's append index (the pagination cursor) |
+| `History(BytesN<32>)` | `Vec<EscrowEvent>` | Legacy pre-pagination log; read as a fallback and migrated on the next append |
 
 ```
 EscrowEvent {
@@ -261,6 +263,14 @@ EscrowEvent {
     timestamp:  u64,
 }
 ```
+
+History is append-only. `get_history_page(invoice_id, cursor, limit)` returns
+at most `limit` events (`1..=MAX_HISTORY_LIMIT`, currently 50) plus
+`next_cursor`; `None` marks the final page. The cursor is the zero-based append
+index, so events appended between page reads (including partial
+`release_to_pool` actions and later re-locks) never shift, duplicate, or skip an
+already-returned event. The legacy `get_history(invoice_id)` view is retained
+for compatibility but hydrates the whole log; new callers should page.
 
 #### Lifecycle
 
@@ -272,8 +282,9 @@ EscrowEvent {
 
 ### Storage Key Count
 
-**Approximately 2 keys per funded invoice** — one `Locked` record and one
-`History` vector (which shares its TTL with the lock).
+**Approximately 2 + N keys per funded invoice** — one `Locked` record, one
+`HistoryCount` counter, and one `HistoryEvent` entry per recorded event (`N`).
+All history keys share the same TTL bump policy as the lock.
 
 ---
 

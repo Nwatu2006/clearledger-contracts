@@ -19,4 +19,10 @@ pub enum EscrowError {
     InvalidRecipient = 7,
     /// Returned when attempting to initialize with colliding addresses (e.g., pool_contract == usdc_asset).
     InvalidConfig = 8,
+    /// Returned when a paginated history read requests a zero limit or a limit
+    /// above [`MAX_HISTORY_LIMIT`](crate::MAX_HISTORY_LIMIT).
+    InvalidLimit = 11,
+    /// Returned when a paginated history read is given a cursor beyond the
+    /// number of recorded events.
+    InvalidCursor = 12,
 }
