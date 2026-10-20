@@ -543,6 +543,229 @@ fn test_preview_deposit_rejects_dust_after_yield() {
     te.pool.preview_deposit(&1);
 }
 
+#[test]
+fn test_preview_withdraw_matches_withdraw_across_share_prices() {
+    // 1:1 share price, including the full balance.
+    for shares in [1u128, 5_000_000_000, 10_000_000_000] {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+
+        let stats_before = te.pool.get_stats();
+        let preview = te.pool.preview_withdraw(&shares);
+        assert_eq!(preview.available_liquidity, stats_before.available_liquidity);
+        assert!(preview.liquidity_ok);
+
+        let withdrawn = te.pool.withdraw(&te.lp, &shares);
+        assert_eq!(preview.usdc_out, withdrawn);
+    }
+
+    // Repayment yield moves the price to 1.02; odd share counts must floor the
+    // same way on both paths.
+    for shares in [1u128, 3, 7, 123_456_789] {
+        let te = setup();
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        fund_and_repay_invoice(&te);
+
+        let preview = te.pool.preview_withdraw(&shares);
+        assert!(preview.liquidity_ok);
+
+        let withdrawn = te.pool.withdraw(&te.lp, &shares);
+        assert_eq!(preview.usdc_out, withdrawn);
+        assert_eq!(
+            preview.usdc_out,
+            shares * 10_200_000_000 / 10_000_000_000
+        );
+    }
+}
+
+#[test]
+fn test_preview_withdraw_floors_odd_share_prices_like_withdraw() {
+    // 10 USDC backing 7 shares: 1 -> 1, 2 -> 2, 3 -> 4, 6 -> 8.
+    for (shares, expected) in [(1u128, 1u128), (2, 2), (3, 4), (6, 8)] {
+        let te = setup();
+        // Fund the pool's token balance, then replace the aggregate accounting
+        // with a state that produces a non-integer share price.
+        te.pool.deposit(&te.lp, &10_000_000_000);
+        te.env.as_contract(&te.pool_id, || {
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalShares, &7u128);
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalDeposits, &10u128);
+            te.env
+                .storage()
+                .instance()
+                .set(&DataKey::TotalFunded, &0u128);
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::LPShares(te.lp.clone()), &7u128);
+        });
+
+        let preview = te.pool.preview_withdraw(&shares);
+        assert_eq!(preview.usdc_out, expected);
+        assert_eq!(preview.available_liquidity, 10);
+        assert!(preview.liquidity_ok);
+
+        assert_eq!(te.pool.withdraw(&te.lp, &shares), expected);
+    }
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_preview_withdraw_zero_shares_panics() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.pool.preview_withdraw(&0);
+}
+
+#[test]
+fn test_preview_withdraw_requires_no_authorization() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.env.set_auths(&[]);
+
+    assert_eq!(te.pool.preview_withdraw(&1).usdc_out, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_preview_withdraw_preserves_dust_guard() {
+    let te = setup();
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalShares, &1_000_000_000_000u128);
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &1u128);
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalFunded, &0u128);
+    });
+
+    te.pool.preview_withdraw(&1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_preview_withdraw_rejects_share_price_overflow() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &u128::MAX);
+    });
+
+    te.pool.preview_withdraw(&10_000_000_000);
+}
+
+#[test]
+fn test_preview_withdraw_reports_insufficient_liquidity_without_panicking() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &DEFAULT_FUNDED_AMOUNT);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    let _ = te.pool.fund_invoice(&invoice_id);
+
+    let stats_before = te.pool.get_stats();
+    assert_eq!(stats_before.available_liquidity, 0);
+
+    let preview = te.pool.preview_withdraw(&1);
+    assert_eq!(preview.usdc_out, 1);
+    assert_eq!(preview.available_liquidity, 0);
+    assert!(!preview.liquidity_ok);
+
+    // The write path still rejects the same quote.
+    assert!(te.pool.try_withdraw(&te.lp, &1).is_err());
+
+    let stats_after = te.pool.get_stats();
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+}
+
+#[test]
+fn test_preview_withdraw_above_lp_balance_reports_liquidity_constraint() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+
+    let requested = 20_000_000_000u128;
+    let position = te.pool.get_lp_position(&te.lp);
+    assert!(requested > position.shares);
+
+    let preview = te.pool.preview_withdraw(&requested);
+    assert_eq!(preview.usdc_out, requested);
+    assert_eq!(preview.available_liquidity, 10_000_000_000);
+    assert!(!preview.liquidity_ok);
+
+    // `withdraw` rejects the same request via its LP-balance guard.
+    assert!(te.pool.try_withdraw(&te.lp, &requested).is_err());
+}
+
+#[test]
+fn test_preview_withdraw_does_not_write_state_emit_events_or_extend_ttl() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &10_000_000_000);
+    fund_and_repay_invoice(&te);
+
+    let stats_before = te.pool.get_stats();
+    let position_before = te.pool.get_lp_position(&te.lp);
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let lp_usdc_before = usdc.balance(&te.lp);
+    let pool_usdc_before = usdc.balance(&te.pool_id);
+    let events_before = te.env.events().all().len();
+
+    // Drain the LP-share entry below TTL_THRESHOLD so any extension performed
+    // by the preview would be visible.
+    let shares_key = DataKey::LPShares(te.lp.clone());
+    let ttl_before_drain: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    te.env
+        .ledger()
+        .set_sequence_number(te.env.ledger().sequence() + ttl_before_drain - 50);
+    let shares_ttl_before: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    let instance_ttl_before: u32 = te
+        .env
+        .as_contract(&te.pool_id, || te.env.storage().instance().get_ttl());
+    assert!(shares_ttl_before < TTL_THRESHOLD);
+    assert!(instance_ttl_before < TTL_THRESHOLD);
+
+    let preview = te.pool.preview_withdraw(&1_000_000_000);
+    assert_eq!(preview.usdc_out, 1_020_000_000);
+    assert!(preview.liquidity_ok);
+
+    let shares_ttl_after: u32 = te.env.as_contract(&te.pool_id, || {
+        te.env.storage().persistent().get_ttl(&shares_key)
+    });
+    let instance_ttl_after: u32 = te
+        .env
+        .as_contract(&te.pool_id, || te.env.storage().instance().get_ttl());
+    assert_eq!(shares_ttl_after, shares_ttl_before);
+    assert_eq!(instance_ttl_after, instance_ttl_before);
+
+    let stats_after = te.pool.get_stats();
+    let position_after = te.pool.get_lp_position(&te.lp);
+    assert_eq!(stats_after.total_deposits, stats_before.total_deposits);
+    assert_eq!(stats_after.total_shares, stats_before.total_shares);
+    assert_eq!(stats_after.available_liquidity, stats_before.available_liquidity);
+    assert_eq!(position_after.shares, position_before.shares);
+    assert_eq!(position_after.usdc_value, position_before.usdc_value);
+    assert_eq!(position_after.yield_earned, position_before.yield_earned);
+    assert_eq!(usdc.balance(&te.lp), lp_usdc_before);
+    assert_eq!(usdc.balance(&te.pool_id), pool_usdc_before);
+    assert_eq!(te.env.events().all().len(), events_before);
+}
+
 //  DUST ATTACK / 0-SHARE TESTS (issue #129)
 // After the pool accrues yield the share price rises above 1.0. A deposit
 // small enough that `usdc_amount * total_shares < total_deposits` would round

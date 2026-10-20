@@ -635,6 +635,61 @@ impl PoolContract {
         Self::shares_for_deposit(&env, usdc_amount)
     }
 
+    /// Previews the USDC a withdrawal of `shares` would return.
+    ///
+    /// Uses the same floor-rounded conversion as `withdraw`
+    /// (`shares * total_deposits / total_shares`) and only reads pool state.
+    /// The returned `WithdrawPreview` also reports the pool's currently
+    /// available liquidity and whether it covers the quoted output, so a
+    /// caller can surface an insufficient-liquidity condition without a
+    /// reverted transaction.
+    ///
+    /// Unlike `withdraw`, this method neither requires nor checks an LP
+    /// address: it quotes the pool's share price and liquidity, while the LP's
+    /// own share balance remains available from `balance`/`get_lp_position`.
+    /// It also does not check pause state, so callers should combine the quote
+    /// with those checks before submitting `withdraw`. It is read-only — no
+    /// authorization, storage writes, events, or TTL extensions occur.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `shares` - The number of shares to quote a redemption for.
+    ///
+    /// # Auth
+    /// No authorization is required.
+    ///
+    /// # Panics
+    /// * `NotInitialized` if the pool is not initialized.
+    /// * `InvalidAmount` if `shares` is zero.
+    /// * `NoShares` if no shares are outstanding.
+    /// * `MinimumDeposit` if the computed USDC redemption rounds down to zero.
+    /// * `Overflow` if `shares * total_deposits` would overflow `u128`.
+    ///
+    /// # Returns
+    /// * `WithdrawPreview` - The quoted USDC output, available liquidity, and
+    ///   whether that liquidity is sufficient.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let preview = client.preview_withdraw(500);
+    /// if preview.liquidity_ok {
+    ///     // preview.usdc_out is what withdraw(&lp, 500) would return.
+    /// }
+    /// ```
+    pub fn preview_withdraw(env: Env, shares: u128) -> WithdrawPreview {
+        Self::require_initialized(&env);
+
+        let totals = Self::totals(&env);
+        let available_liquidity = totals.deposits - totals.funded;
+        let usdc_out = Self::usdc_for_withdraw(&env, shares, totals.shares, totals.deposits);
+
+        WithdrawPreview {
+            usdc_out,
+            available_liquidity,
+            liquidity_ok: usdc_out <= available_liquidity,
+        }
+    }
+
     /// Withdraws shares from the pool and transfers USDC to the LP.
     ///
     /// # Arguments
@@ -695,13 +750,7 @@ impl PoolContract {
         let total_funded = totals.funded;
         let available = total_deposits - total_funded;
 
-        let scaled = shares
-            .checked_mul(total_deposits)
-            .unwrap_or_else(|| panic_with_error!(&env, PoolError::Overflow));
-        let usdc_to_return = scaled / total_shares;
-        if usdc_to_return == 0 {
-            panic_with_error!(&env, PoolError::MinimumDeposit);
-        }
+        let usdc_to_return = Self::usdc_for_withdraw(&env, shares, total_shares, total_deposits);
         if usdc_to_return > available {
             panic_with_error!(&env, PoolError::InsufficientLiquidity);
         }
@@ -2094,6 +2143,36 @@ impl PoolContract {
         }
 
         shares_to_issue
+    }
+
+    /// Converts LP shares to the USDC `withdraw` would return.
+    ///
+    /// This is the single source of truth for withdrawal rounding: integer
+    /// division floors the result, and the zero-output dust guard matches the
+    /// deposit-side one. Both `withdraw` and `preview_withdraw` call this, so a
+    /// quote can never drift from the amount the write path pays out.
+    fn usdc_for_withdraw(
+        env: &Env,
+        shares: u128,
+        total_shares: u128,
+        total_deposits: u128,
+    ) -> u128 {
+        if shares == 0 {
+            panic_with_error!(env, PoolError::InvalidAmount);
+        }
+        if total_shares == 0 {
+            panic_with_error!(env, PoolError::NoShares);
+        }
+
+        let scaled = shares
+            .checked_mul(total_deposits)
+            .unwrap_or_else(|| panic_with_error!(env, PoolError::Overflow));
+        let usdc_to_return = scaled / total_shares;
+        if usdc_to_return == 0 {
+            panic_with_error!(env, PoolError::MinimumDeposit);
+        }
+
+        usdc_to_return
     }
 
     fn registry_contract(env: &Env) -> Address {
