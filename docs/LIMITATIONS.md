@@ -13,6 +13,7 @@ yet handled.
 
 - [Testnet Limitations](#testnet-limitations)
 - [Gas & Budget](#gas--budget)
+- [Integer Arithmetic and Rounding](#integer-arithmetic-and-rounding)
 - [Known Gaps](#known-gaps)
 - [Unhandled Edge Cases](#unhandled-edge-cases)
 - [Planned But Not Implemented](#planned-but-not-implemented)
@@ -121,9 +122,14 @@ The benchmark demonstrates negligible gas overhead (~0.25% CPU instruction delta
   `get_by_buyer`) are paginated (`page`, `page_size`, capped at
   `MAX_PAGE_SIZE`), so each call hydrates a bounded number of invoices no
   matter how many entries the index holds (issue #71). Callers page until an
-  empty result is returned. The status index is append-only, so a page can
-  return fewer than `page_size` invoices when it contains stale entries whose
-  invoice has since moved to another status.
+  empty result is returned.
+- The status index is a bounded membership index (issue #22): entering a
+  status appends one slot plus its `StatusPosition`, and leaving swap-and-pops
+  in O(1) using that position, so transitions never scan the status's
+  historical invoices. `get_by_status` reads only the requested page of live
+  members. Pre-upgrade rows without a position are located once on their next
+  transition, or eagerly via admin `migrate_status_index`; until migrated, a
+  page may be shorter than `page_size` because stale rows are filtered out.
 - `get_invoice_count_by_issuer` and `get_invoice_count_by_buyer` avoid that
   cost entirely: they read a single stored counter (`u32`) in O(1), so
   pagination and badge UIs should prefer them over `.len()` on the
@@ -164,18 +170,35 @@ capacity stop skipped.
 
 ### Escrow History Growth
 
-`escrow::append_history` stores each event in its own `HistoryEvent`
-entry plus a `HistoryCount` counter, so `get_history_page(invoice_id,
-cursor, limit)` hydrates at most `limit` events (capped at
-`MAX_HISTORY_LIMIT`, 50). Reads are therefore bounded regardless of how
-many events an invoice has accumulated.
+Escrow events are stored as individually indexed `HistoryEvent` entries with
+`HistoryCount` and `HistoryStart` cursors. `get_history_page(invoice_id,
+cursor, limit)` hydrates at most `limit` events (maximum 50), while the
+contract retains at most `MAX_HISTORY_EVENTS` (32) events per invoice. When
+the cap is exceeded, the oldest on-chain entries are evicted without
+renumbering survivors; admin `compact_history` can reduce retention further in
+batches. The legacy `get_history` view remains available but returns all
+retained events at once. Full historical detail remains in the emitted ledger
+events for indexers. Legacy `History` vectors migrate to indexed entries on the
+next append or compaction.
 
-History is append-only and the cursor is the append index, so walking
-pages while partial releases or re-locks add new events cannot produce
-duplicates or gaps. The legacy `get_history(invoice_id)` view remains
-for compatibility; it still hydrates the whole log and should not be
-used for large histories. Old `History` vectors are read as a fallback
-and migrated to per-event entries on the next append.
+## Integer Arithmetic and Rounding
+
+Contract amounts use integer stroops and basis points; division truncates
+toward zero (equivalent to floor for these non-negative values). The current
+calculation policy is:
+
+| Calculation | Rounding direction | Boundary behavior |
+| --- | --- | --- |
+| Invoice funding: `face_value * (10_000 - discount_bps) / 10_000` | Down | Fractional stroops are not funded and remain in the buyer's discount. |
+| Protocol fee: `yield * fee_bps / 10_000` | Down | The unallocated whole-stroop remainder is credited to LP yield; treasury plus LPs conserve the yield. |
+| Deposit shares: `amount * total_shares / total_deposits` | Down | A result of zero is rejected with `MinimumDeposit`; the smallest accepted amount mints at least one share. |
+| Redemption and position value: `shares * total_deposits / total_shares` | Down | A zero-valued withdrawal is rejected; read-only position values may omit a fractional stroop. |
+| Early repayment: `discount * elapsed / term` | Down | The buyer receives `discount - earned_by_pool`; fractional accrual is not overpaid to the pool. Partial installments do not separately accrue this discount. |
+| Default recovery | No proportional split | Escrow returns the full locked principal; the pool records the full funded amount as realised loss while leaving LP deposits and share value unchanged. |
+
+These are deliberate economic choices, not precision guarantees: callers should
+expect at most a small whole-stroop difference from exact rational arithmetic.
+Boundary regressions live alongside the pool and invoice contract tests.
 
 ---
 
@@ -208,7 +231,9 @@ released to the issuer via `escrow.release_to_issuer()`. This call is
 Issue #56.
 **Status:** Unresolved. This is the highest-priority gap before mainnet.
 **Workaround:** An admin or automated off-chain bot must call
-`escrow.release_to_issuer(invoice_id, issuer)` separately after funding.
+`escrow.release_to_issuer(invoice_id, issuer)` separately after funding, using
+the exact issuer address recorded by `escrow.lock()`. Any other address is
+rejected with `InvalidRecipient`.
 
 ### No Early Repayment Incentive Logic
 
@@ -216,13 +241,6 @@ The protocol does not apply dynamic discount rates based on how early
 repayment occurs. The buyer pays the full `face_value` regardless of how
 early they repay, so there is no on-chain rebate proportional to the time
 remaining on the invoice.
-
-### No Accessor for `funded_amount` on Invoice Contract
-
-While `get_face_value`, `get_discount_bps`, and `get_funding_asset` are
-exposed as per-field view functions (one storage read each), there is no
-dedicated `get_funded_amount` accessor. Callers currently read the full
-`Invoice` struct via `get()`.
 
 ### No Duplicate Invoice Detection
 
@@ -245,7 +263,7 @@ terms.
 | Buyer repays exactly on `due_date`                                     | `invoice.repay` succeeds; `trigger_default` panics with `DueDateNotPassed`                          | Asymmetric: `repay` has no time gate beyond `status == Confirmed`; `trigger_default` requires `current_time > due_date` (strict)        |
 | `confirm_delivery` called after invoice is already confirmed           | Panics with `InvalidStatusTransition` because status is `Confirmed` not `Active`                    | Correct — prevents replay                                                                                                               |
 | `withdraw` when pool has funded invoices but no available liquidity    | Panics with `InsufficientLiquidity`                                                                 | Correct — prevents breaking the pool invariant                                                                                          |
-| Admin calls `set_max_utilization` to 0                                 | All `fund_invoice` calls will fail (utilization ≥ 0% ≥ cap of 0)                                    | This is a denial-of-service vector available to admin                                                                                   |
+| Admin attempts `set_max_utilization(0)`                                 | The configuration call fails with typed `InvalidConfiguration`; the previous cap remains active      | Zero is rejected because it would make every positive funding attempt fail                                                              |
 | Calling `revoke` on an unregistered address                            | Panics with `NotFound`                                                                              | Per spec                                                                                                                                |
 | Calling `batch_register_issuers` with more than 50 entries             | Panics with `BatchSizeExceeded`                                                                     | Gas protection                                                                                                                          |
 | A buyer repays _less_ than `face_value`                                | Not possible on the buyer path — `invoice.repay` transfers the full `face_value` from buyer to pool | Partial amounts are only possible through `escrow::release_to_pool` during default / partial-repayment flows; see [Resolved](#resolved) |
@@ -307,10 +325,12 @@ the 2025-07-25 revision.
 > In reality `move_status_index` and the `extend_*_index` helpers linearly
 > scan the index on every transition, index rows are still not compacted,
 > and `get_by_status` skips stale rows only by loading each invoice and
-> comparing its status. The item remains open and the O(n) linear-scan
-> behaviour is tracked in
-> #831;
-> this document will be updated again when that lands.
+> comparing its status. This was subsequently fixed by issue #22: the status
+> index is now a compacted membership index with an O(1)
+> `DataKey::StatusPosition` slot map, swap-and-pop removal, and a bounded
+> admin migration (`migrate_status_index`) for pre-existing rows. See
+> [STORAGE.md](STORAGE.md#status-index-migration-upgrade-note). The historical
+> tracker was #831.
 
 - **Pool does not track individual LP yield accrual.** `pool::withdraw`
   now writes `DataKey::LPYieldEarned(lp)` and `pool::get_lp_position`
@@ -337,7 +357,7 @@ the 2025-07-25 revision.
 - #294 — Testnet limitation docs
 - #307 — General repo documentation
 - #460 — LIMITATIONS.md stale date (this PR fixes it)
-- #831 — Index helpers linearly scan whole indexes (open — tracks the linear-scan performance work; update this document when a real index/membership structure lands)
+- #831 — Index helpers linearly scan whole indexes (fixed for the status index by issue #22; issuer/buyer indexes remain append-only by design)
 - #835 — LIMITATIONS.md documents a `DataKey::StatusMembership` that does not exist (this PR fixes it)
 
 Resolved items reference the PRs that closed them:

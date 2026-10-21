@@ -7,8 +7,9 @@ use soroban_sdk::{contracttype, BytesN, Vec};
 /// - `amount` must be greater than zero — guaranteed by [`EscrowContract::lock`].
 /// - `locked_at` is set to `env.ledger().timestamp()` at lock time and is never
 ///   updated for the lifetime of the record.
-/// - A record is removed (via `persistent().remove`) when escrow is released
-///   or default-handled; after removal `get_locked` / `get_locked_at` return `0`.
+/// - Partial pool releases reduce `amount` and retain this record. Terminal
+///   release or default removes it; afterward `get_locked` / `get_locked_at`
+///   return `0`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRecord {
@@ -23,8 +24,10 @@ pub struct EscrowRecord {
     /// a [`default`](EscrowAction::DefaultHandled) can be triggered.
     pub locked_at: u64,
     /// The invoice issuer address that is authorized to receive released funds.
-    /// Set from the `issuer` argument of [`EscrowContract::lock`] and validated
-    /// in [`EscrowContract::release_to_issuer`].
+    /// Set from the `issuer` argument of [`EscrowContract::lock`] and treated as
+    /// the sole source of truth by [`EscrowContract::release_to_issuer`]: a
+    /// caller-supplied address must match this value, and the release transfer
+    /// always uses this stored value.
     pub issuer: soroban_sdk::Address,
 }
 
@@ -46,11 +49,11 @@ pub enum EscrowAction {
 
 /// An entry in the escrow event history for a given invoice.
 ///
-/// History is append-only. Events are stored individually under
-/// [`DataKey::HistoryEvent`] with their append index, so a paginated read
-/// hydrates only the requested slice. The append index is the cursor and the
-/// chronological order: tie-breaking equal timestamps by insertion order keeps
-/// ordering stable across partial releases and later appends.
+/// Events are stored individually under [`DataKey::HistoryEvent`] with their
+/// append index, so a paginated read hydrates only the requested slice. The
+/// append index remains stable when older entries are pruned; `HistoryStart`
+/// identifies the oldest retained index. Full event history remains in the
+/// ledger event stream for indexers.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EscrowEvent {
@@ -78,7 +81,7 @@ pub struct EscrowEvent {
 pub struct HistoryPage {
     /// Events in chronological (append) order, at most `limit` long.
     pub items: Vec<EscrowEvent>,
-    /// Cursor to pass to the next call, or `None` when the walk is complete.
+    /// Append index to pass to the next call, or `None` when the walk is complete.
     pub next_cursor: Option<u32>,
 }
 
@@ -114,4 +117,7 @@ pub enum DataKey {
     HistoryEvent(BytesN<32>, u32),
     /// Number of history events stored for an invoice. Value type: `u32`.
     HistoryCount(BytesN<32>),
+    /// First retained append index after automatic or manual history pruning.
+    /// The monotonically increasing `HistoryCount` remains the cursor ceiling.
+    HistoryStart(BytesN<32>),
 }
